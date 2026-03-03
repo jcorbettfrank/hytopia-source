@@ -5,11 +5,13 @@ import archiver from 'archiver';
 import fs from 'fs';
 import path from 'path';
 import nodemon from 'nodemon';
+import qrcode from 'qrcode-terminal';
 import readline from 'readline';
 import { fileURLToPath } from 'url';
 
 // Store command-line flags
 const flags = {};
+const BOOLEAN_FLAGS = new Set([ 'tunnel', 'help' ]);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -30,21 +32,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
   }
     
   // Parse command-line flags
-  parseCommandLineFlags();
+  const positionalArgs = parseCommandLineFlags();
   
   // Execute the appropriate command
   const commandHandlers = {
-    'build': () => build(false, process.argv[3]),
-    'build-dev': () => build(true, process.argv[3]),
+    'build': () => build(false, positionalArgs[0]),
+    'build-dev': () => build(true, positionalArgs[0]),
     'help': displayHelp,
     'init': init,
     'init-mcp': initMcp,
     'package': packageProject,
-    'run': run,
-    'start': start,
-    'upgrade-assets-library': () => upgradeAssetsLibrary(process.argv[3] || 'latest'),
-    'upgrade-cli': () => upgradeCli(process.argv[3] || 'latest'),
-    'upgrade-project': () => upgradeProject(process.argv[3] || 'latest'),
+    'run': () => run(positionalArgs[0]),
+    'start': () => start(positionalArgs),
+    'upgrade-assets-library': () => upgradeAssetsLibrary(positionalArgs[0] || 'latest'),
+    'upgrade-cli': () => upgradeCli(positionalArgs[0] || 'latest'),
+    'upgrade-project': () => upgradeProject(positionalArgs[0] || 'latest'),
     'version': displayVersion,
   };
 
@@ -70,16 +72,94 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  */
 
 /**
+ * Start command
+ *
  * Runs a hytopia project's index file using node.js
- * and watches for changes.
+ * and watches for changes. Optionally opens a Cloudflare
+ * quick tunnel so the local server is reachable from
+ * other devices (phones, tablets, etc.) on any network.
+ *
+ * @example
+ * `hytopia start`
+ * `hytopia start playground.ts`
+ * `hytopia start --tunnel`
+ * `hytopia start playground.ts --tunnel`
  */
-async function start() {
+async function start(positionalArgs = []) {
+  if (isTruthyFlag(flags.help) || process.argv.includes('-h')) {
+    displayHelp();
+
+    return;
+  }
+
   const projectRoot = process.cwd();
-  const inputFile = process.argv[3] || 'index.ts';
+  const inputFile = positionalArgs[0] || 'index.ts';
   const outputFile = inputFile.replace(/\.ts$/, '.mjs');
   const entryFile = path.join(projectRoot, outputFile);
   const buildCmd = `hytopia build-dev ${inputFile}`;
   const runCmd = `"${process.execPath}" --enable-source-maps "${entryFile}"`;
+  const port = process.env.PORT || '8080';
+  const useTunnel = isTruthyFlag(flags.tunnel);
+  let tunnelProcess = null;
+  let tunnelStartupProcess = null;
+  let shuttingDown = false;
+
+  const killProc = (proc) => {
+    proc.kill('SIGTERM');
+    setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 2000);
+  };
+
+  const cleanup = () => {
+    if (tunnelProcess) {
+      killProc(tunnelProcess);
+      tunnelProcess = null;
+    }
+
+    if (tunnelStartupProcess) {
+      killProc(tunnelStartupProcess);
+      tunnelStartupProcess = null;
+    }
+  };
+
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    cleanup();
+
+    const code = signal === 'SIGINT' ? 130 : signal === 'SIGTERM' ? 143 : 0;
+    process.exit(code);
+  };
+
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  logDivider();
+
+  if (useTunnel) {
+    console.log('🔗 Starting tunnel for mobile access...');
+    try {
+      const tunnel = await startTunnel(port, (proc) => {
+        tunnelStartupProcess = proc;
+      });
+      tunnelProcess = tunnel.process;
+      tunnelStartupProcess = null;
+      const playUrl = `https://hytopia.com/play/?join=${new URL(tunnel.url).host}`;
+      console.log('📱 Scan to play on your phone:');
+      console.log('');
+      qrcode.generate(playUrl, { small: true });
+      console.log('');
+      console.log(`   Mobile: ${playUrl}`);
+    } catch (err) {
+      tunnelStartupProcess = null;
+      console.warn('⚠️  Could not start tunnel. Make sure you have an internet connection.');
+      console.warn('   Install cloudflared and ensure it is available in PATH.');
+      console.warn('   Optional: set HYTOPIA_CLOUDFLARED_NPX_PACKAGE=<name@version> to run a pinned npx package.');
+      if (process.env.DEBUG) console.error(err);
+    }
+  }
+
+  console.log(`   Local:  https://hytopia.com/play/?join=local.hytopiahosting.com:${port}`);
+  logDivider();
 
   // Start nodemon to watch for changes, rebuild, then run the server
   nodemon({
@@ -90,6 +170,7 @@ async function start() {
     delay: 100,
   })
   .on('quit', () => {
+    cleanup();
     console.log('👋 Shutting down...');
     process.exit();
   });
@@ -105,9 +186,8 @@ async function start() {
  * `hytopia run`
  * `hytopia run playground.ts`
  */
-async function run() {
+async function run(inputFile = 'index.ts') {
   const projectRoot = process.cwd();
-  const inputFile = process.argv[3] || 'index.ts';
   const outputFile = inputFile.replace(/\.ts$/, '.mjs');
   const entryFile = path.join(projectRoot, outputFile);
 
@@ -499,6 +579,73 @@ async function packageProject() {
 // ================================================================================
 
 
+/**
+ * Starts a Cloudflare quick tunnel pointing at the local dev server.
+ *
+ * Uses `cloudflared tunnel` (or an npx-wrapped version if
+ * `HYTOPIA_CLOUDFLARED_NPX_PACKAGE` is set) with `--no-tls-verify`
+ * because the local server uses a self-signed certificate.
+ *
+ * @param {string} port - Local HTTPS port to tunnel to.
+ * @param {(proc: import('child_process').ChildProcess) => void} onProcessCreated
+ *   Called synchronously with the spawned process as soon as it is created,
+ *   before the tunnel URL is known. This lets the caller track the process
+ *   for cleanup if the user aborts during tunnel startup.
+ * @returns {Promise<{ url: string, process: import('child_process').ChildProcess }>}
+ *   Resolves with the public tunnel URL and the long-lived child process.
+ *   Rejects if the tunnel fails to produce a URL within 30 seconds.
+ */
+function startTunnel(port, onProcessCreated = () => {}) {
+  return new Promise((resolve, reject) => {
+    const npxPackage = process.env.HYTOPIA_CLOUDFLARED_NPX_PACKAGE;
+    const command = npxPackage ? 'npx' : (process.env.HYTOPIA_CLOUDFLARED_BIN || 'cloudflared');
+    const args = npxPackage
+      // --no-tls-verify: local dev server uses a self-signed cert (local.hytopiahosting.com)
+      ? [ '--yes', '--package', npxPackage, 'cloudflared', 'tunnel', '--url', `https://local.hytopiahosting.com:${port}`, '--no-tls-verify' ]
+      : [ 'tunnel', '--url', `https://local.hytopiahosting.com:${port}`, '--no-tls-verify' ];
+
+    const proc = spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    onProcessCreated(proc);
+
+    let settled = false;
+
+    const timer = setTimeout(() => {
+      if (!settled) {
+        settled = true;
+        proc.kill();
+        reject(new Error('Tunnel startup timed out'));
+      }
+    }, 30000);
+
+    const onData = (data) => {
+      if (settled) return;
+      const match = data.toString().match(/https:\/\/[\w-]+\.trycloudflare\.com/);
+      if (match) {
+        settled = true;
+        clearTimeout(timer);
+        resolve({ url: match[0], process: proc });
+      }
+    };
+
+    proc.stdout.on('data', onData);
+    proc.stderr.on('data', onData);
+
+    proc.on('error', (err) => {
+      if (!settled) { settled = true; clearTimeout(timer); reject(err); }
+    });
+
+    proc.on('close', (code) => {
+      if (!settled) {
+        settled = true;
+        clearTimeout(timer);
+        reject(new Error(`cloudflared exited with code ${code} before providing a tunnel URL`));
+      }
+    });
+  });
+}
+
 async function build(devMode = false, inputFile = 'index.ts') {
   const outputFile = inputFile.replace(/\.ts$/, '.mjs');
   const envFlags = devMode ? '' : '--minify-whitespace --minify-syntax';
@@ -510,18 +657,61 @@ async function build(devMode = false, inputFile = 'index.ts') {
  * Parses command-line flags in the format --flag value
  */
 function parseCommandLineFlags() {
-  for (let i = 3; i < process.argv.length; i += 2) {
-    if (i % 2 === 1) { // Odd indices are flags
-      let flag = process.argv[i].replace('--', '');
-      let value = process.argv[i + 1];
+  Object.keys(flags).forEach(flag => delete flags[flag]);
+  const positionalArgs = [];
 
-      if (flag.includes('=')) {
-        [ flag, value ] = flag.split('=');
-      }
+  for (let i = 3; i < process.argv.length; i++) {
+    const arg = process.argv[i];
 
-      flags[flag] = value;
+    if (!arg.startsWith('--')) {
+      positionalArgs.push(arg);
+      continue;
     }
+
+    let flag = arg.slice(2);
+    let value;
+
+    if (!flag) {
+      continue;
+    }
+
+    if (flag.includes('=')) {
+      const eqIdx = flag.indexOf('=');
+      value = flag.slice(eqIdx + 1);
+      flag = flag.slice(0, eqIdx);
+      flags[flag] = value;
+      continue;
+    }
+
+    if (BOOLEAN_FLAGS.has(flag)) {
+      flags[flag] = true;
+      continue;
+    }
+
+    const next = process.argv[i + 1];
+
+    if (next && !next.startsWith('--')) {
+      flags[flag] = next;
+      i++;
+      continue;
+    }
+
+    flags[flag] = true;
   }
+
+  return positionalArgs;
+}
+
+/**
+ * Returns true if a parsed flag value should be treated as enabled.
+ * Handles both `--flag` (parsed as boolean `true` via BOOLEAN_FLAGS)
+ * and `--flag=true` (parsed as string `"true"` via the `=` path).
+ */
+function isTruthyFlag(value) {
+  if (value === true) return true;
+  if (typeof value !== 'string') return false;
+
+  return [ '1', 'true', 'yes', 'on' ].includes(value.toLowerCase());
 }
 
 /**
@@ -645,7 +835,7 @@ function displayHelp() {
   console.log('  version, -v, --version      Show CLI version');
   console.log('  build [FILE]                Build the project (Generates ESM .mjs from FILE, default: index.ts)');
   console.log('  build-dev [FILE]            Build in dev mode (Generates ESM .mjs from FILE, default: index.ts)');
-  console.log('  start [FILE]                Start a HYTOPIA project server (Node.js & nodemon watch, default: index.ts)');
+  console.log('  start [FILE] [--tunnel]     Start a HYTOPIA project server (--tunnel: tunnel + QR code for phone testing)');
   console.log('  run [FILE]                  Run the project once without watching (default: index.ts)');
   console.log('  init [--template NAME]      Initialize a new project');
   console.log('  init-mcp                    Setup MCP integrations');
@@ -657,5 +847,6 @@ function displayHelp() {
   console.log('Examples:');
   console.log('  hytopia init --template zombies-fps');
   console.log('  hytopia start playground.ts');
+  console.log('  hytopia start --tunnel');
   console.log('  hytopia upgrade-project 0.8.12');
 }

@@ -72,7 +72,7 @@ export default class Servers {
         }
 
         const serverDetails = await response.json();
-        
+
         version = serverDetails.version;
 
         await this._validateServerVersionCompat(version, hostname);

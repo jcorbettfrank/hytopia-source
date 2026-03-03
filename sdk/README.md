@@ -50,3 +50,19 @@ HYTOPIA overcomes the creativity limits of Minecraft, the complexities of Unity 
 Bring your own game assets as GLTF models with full server-driven animation support, block textures, ambient and sfx audio, and more - or use HYTOPIA's defaults included with this SDK to craft your game.
 
 We built HYTOPIA to empower both veteran and aspiring game developers to create multiplayer-first, voxel-style, hyper-sharable games. Developer APIs and documentations are simple, powerful and clear. Whether you've been building games for years, a frontend web developer who's dreamed of building a game, an eager learner that's always dreamed of building games, or a curious school student, HYTOPIA was built for you..
+
+## Remote Device Testing (Tunnel)
+
+Use the tunnel option to generate a mobile-friendly join URL and QR code:
+
+```bash
+hytopia start --tunnel
+```
+
+If `cloudflared` is not installed globally, use the npx package path:
+
+```bash
+HYTOPIA_CLOUDFLARED_NPX_PACKAGE=cloudflared@<version> hytopia start --tunnel
+```
+
+For reproducible team workflows, pin the cloudflared package version.

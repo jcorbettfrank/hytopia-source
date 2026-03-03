@@ -81,7 +81,8 @@ export interface WebServerEventPayloads {
   [WebServerEvent.UPGRADE]: { req: http.IncomingMessage, socket: RawSocket, head: Buffer };
 }
 
-const CORS = { 'access-control-allow-origin': '*' };
+const LOCAL_CORS_ORIGIN_HOSTS = new Set([ 'localhost', '127.0.0.1', '::1' ]);
+const ALLOWED_CORS_ORIGIN_HOSTS = new Set([ 'hytopia.com', 'play.hytopia.com', 'dev-local.hytopia.com' ]);
 const MIME: Record<string, string> = {
   '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript',
   '.json': 'application/json', '.gltf': 'model/gltf+json', '.glb': 'model/gltf-binary',
@@ -92,6 +93,74 @@ const MIME: Record<string, string> = {
   '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
   '.bin': 'application/octet-stream', '.wasm': 'application/wasm',
 };
+
+/**
+ * Checks whether an HTTP `Origin` header value is on the CORS allowlist.
+ *
+ * @remarks
+ * Local origins (`localhost`, `127.0.0.1`, `::1`) are allowed over both
+ * `http:` and `https:`. Remote origins must use `https:` and belong to
+ * {@link ALLOWED_CORS_ORIGIN_HOSTS} or any subdomain of `play.hytopia.com`.
+ *
+ * @param origin - The full origin string from the request (e.g. `https://hytopia.com`).
+ * @returns `true` if the origin is allowed, `false` otherwise.
+ *
+ * **Category:** Networking
+ * @internal
+ */
+function isAllowedCorsOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+    const host = url.hostname.toLowerCase();
+    const protocol = url.protocol;
+
+    if (LOCAL_CORS_ORIGIN_HOSTS.has(host)) {
+      return protocol === 'http:' || protocol === 'https:';
+    }
+
+    if (protocol !== 'https:') {
+      return false;
+    }
+
+    if (ALLOWED_CORS_ORIGIN_HOSTS.has(host)) {
+      return true;
+    }
+
+    return host.endsWith('.play.hytopia.com');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Builds the CORS response headers for a given request.
+ *
+ * @remarks
+ * Returns an empty object when the request has no `Origin` header or the
+ * origin is not on the allowlist. When allowed, mirrors the origin back
+ * via `access-control-allow-origin` and sets `Vary: origin` so caches
+ * distinguish per-origin responses. Also includes
+ * `access-control-allow-private-network` which is required for local
+ * dev (browser to localhost) and is harmless on public servers.
+ *
+ * @param req - The incoming HTTP request.
+ * @returns A header map to spread onto the response, or `{}` if disallowed.
+ *
+ * **Category:** Networking
+ * @internal
+ */
+function getCorsHeaders(req: http.IncomingMessage): Record<string, string> {
+  const origin = req.headers.origin;
+  if (typeof origin !== 'string' || !isAllowedCorsOrigin(origin)) {
+    return {};
+  }
+
+  return {
+    'access-control-allow-origin': origin,
+    'access-control-allow-private-network': 'true',
+    'vary': 'origin',
+  };
+}
 
 /**
  * HTTPS/HTTP2 server for serving assets and handling connection upgrades.
@@ -199,9 +268,29 @@ export default class WebServer extends EventRouter {
     const reqPath = req.url || '/';
     const method = req.method || 'GET';
     const isHead = method === 'HEAD';
+    const corsHeaders = getCorsHeaders(req);
     const respond = (status: number, hdrs: Record<string, string | number> = {}) => {
-      res.writeHead(status, { ...hdrs, ...CORS });
+      res.writeHead(status, { ...hdrs, ...corsHeaders });
     };
+
+    // CORS preflight (includes Private Network Access)
+    if (method === 'OPTIONS') {
+      if (!corsHeaders['access-control-allow-origin']) {
+        respond(403);
+        res.end();
+
+        return;
+      }
+
+      respond(204, {
+        'access-control-allow-methods': 'GET, HEAD, OPTIONS',
+        'access-control-allow-headers': 'Content-Type',
+        'access-control-max-age': '86400',
+      });
+      res.end();
+
+      return;
+    }
 
     // Health check
     if (reqPath === '/') {
